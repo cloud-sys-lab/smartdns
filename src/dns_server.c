@@ -33,6 +33,7 @@
 #include "nftset.h"
 #include "tlog.h"
 #include "util.h"
+#include "uthash.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -61,6 +62,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <syslog.h>
+#include <time.h>
 
 #define DNS_MAX_EVENTS 256
 #define IPV6_READY_CHECK_TIME 180
@@ -414,6 +416,24 @@ struct dns_server {
 	struct local_addr_cache local_addr_cache;
 };
 
+// Struct for uthash
+struct my_struct {
+	uint16_t transaction_id;
+	uint64_t receive_query;
+	uint64_t cache_hit;
+	uint64_t cache_miss;
+	uint64_t resolve_callback;
+	uint64_t respond_to_client;
+	UT_hash_handle hh;
+};
+
+// From uthash docs: Your hash must be declared as a NULL-initialized pointer to your structure.
+struct my_struct *ts_table = NULL;
+
+// Read-write lock to protect the uthash
+pthread_rwlock_t uthash_lock;
+
+
 static int is_server_init;
 static struct dns_server server;
 
@@ -438,6 +458,10 @@ static const char *_dns_server_get_request_server_groupname(struct dns_request *
 static int _dns_server_tcp_socket_send(struct dns_server_conn_tcp_client *tcp_client, void *data, int data_len);
 static int _dns_server_update_request_connection_timeout(struct dns_server_conn_head *conn, int timeout);
 static int _dns_server_cache_save(int check_lock);
+static void add_entry(uint16_t transaction_id, uint64_t ts, int ts_option);
+static int find_entry(uint16_t transaction_id);
+static int remove_entry(uint16_t transaction_id);
+static void destroy_entries(void);
 
 int dns_is_ipv6_ready(void)
 {
@@ -1513,6 +1537,14 @@ static int _dns_server_reply_udp(struct dns_request *request, struct dns_server_
 	} else {
 		goto use_send;
 	}
+
+	//Replying to client, last step
+	struct timespec reply_time;
+	uint64_t timestamp;
+	clock_gettime(CLOCK_MONOTONIC, &reply_time);
+	timestamp = (uint64_t)(reply_time.tv_sec * 1000000000) + (uint64_t)reply_time.tv_nsec;
+	add_entry(request->id, timestamp, 5);
+
 
 	send_len = sendmsg(udpserver->head.fd, &msg, 0);
 	if (send_len == inpacket_len) {
@@ -4636,6 +4668,13 @@ static int dns_server_resolve_callback(const char *domain, dns_result_type rtype
 	int need_passthrouh = 0;
 	unsigned long result_flag = dns_client_server_result_flag(server_info);
 
+	//Resolve callback timestamp
+	struct timespec resolve_time;
+	uint64_t timestamp;
+	clock_gettime(CLOCK_MONOTONIC, &resolve_time);
+	timestamp = (uint64_t)(resolve_time.tv_sec * 1000000000) + (uint64_t)resolve_time.tv_nsec;
+	add_entry(request->id, timestamp, 4);
+
 	if (request == NULL) {
 		return -1;
 	}
@@ -6272,6 +6311,7 @@ static int _dns_server_process_cache(struct dns_request *request)
 	struct dns_cache *dns_cache = NULL;
 	struct dns_cache *dualstack_dns_cache = NULL;
 	int ret = -1;
+	uint64_t timestamp;
 
 	if (_dns_server_has_bind_flag(request, BIND_FLAG_NO_CACHE) == 0) {
 		goto out;
@@ -6340,12 +6380,23 @@ reply_cache:
 		goto out;
 	}
 
+	//Cache something timestamp??
+	struct timespec cache_time;
+	clock_gettime(CLOCK_MONOTONIC, &cache_time);
+	timestamp = (uint64_t)(cache_time.tv_sec * 1000000000) + (uint64_t)cache_time.tv_nsec;
+	add_entry(request->id, timestamp, 2);
 	ret = _dns_server_process_cache_data(request, dns_cache);
 	if (ret != 0) {
 		goto out;
 	}
 
 out_update_cache:
+	//Cache hit timestamp
+	struct timespec cache_hit_time;
+	clock_gettime(CLOCK_MONOTONIC, &cache_hit_time);
+	timestamp = (uint64_t)(cache_hit_time.tv_sec * 1000000000) + (uint64_t)cache_hit_time.tv_nsec;
+	add_entry(request->id, timestamp, 2);
+
 	if (dns_cache_get_ttl(dns_cache) == 0) {
 		struct dns_server_query_option dns_query_options;
 		int prefetch_flags = 0;
@@ -6373,6 +6424,12 @@ out_update_cache:
 	}
 
 out:
+	//Cache miss timestamp
+	struct timespec cache_miss_time;
+	clock_gettime(CLOCK_MONOTONIC, &cache_miss_time);
+	timestamp = (uint64_t)(cache_miss_time.tv_sec * 1000000000) + (uint64_t)cache_miss_time.tv_nsec;
+	add_entry(request->id, timestamp, 3);
+
 	if (dns_cache) {
 		dns_cache_release(dns_cache);
 	}
@@ -6985,7 +7042,7 @@ static int _dns_server_do_query(struct dns_request *request, int skip_notify_eve
 	if (_dns_server_process_dns64(request) != 0) {
 		goto errout;
 	}
-
+    // XXXXX
 	// Get reference for DNS query
 	request->request_wait++;
 	_dns_server_request_get(request);
@@ -7163,6 +7220,12 @@ static int _dns_server_recv(struct dns_server_conn_head *conn, unsigned char *in
 		}
 		goto errout;
 	}
+
+	struct timespec recv_time;
+	uint64_t timestamp;
+	clock_gettime(CLOCK_MONOTONIC, &recv_time);
+	timestamp = (uint64_t)(recv_time.tv_sec * 1000000000) + (uint64_t)recv_time.tv_nsec;
+	add_entry(packet->head.id, timestamp, 1);
 
 	if (smartdns_plugin_func_server_recv(packet, inpacket, inpacket_len, local, local_len, from, from_len) != 0) {
 		return 0;
@@ -8572,6 +8635,9 @@ int dns_server_run(void)
 	int sleep = 100;
 	int sleep_time = 0;
 	unsigned long expect_time = 0;
+	if (pthread_rwlock_init(&uthash_lock, NULL) != 0) {
+		tlog(TLOG_ERROR, "Can't create rwlock for uthash\n");
+	};
 
 	sleep_time = sleep;
 	now = get_tick_count() - sleep;
@@ -9395,6 +9461,54 @@ void dns_server_exit(void)
 	_dns_server_request_remove_all();
 	pthread_mutex_destroy(&server.request_list_lock);
 	dns_cache_destroy();
+	destroy_entries();
 
 	is_server_init = 0;
+}
+
+void add_entry(uint16_t tr_id, uint64_t timestamp, int ts_option) {
+	struct my_struct *s;
+
+	pthread_rwlock_wrlock(&uthash_lock);
+	HASH_FIND(hh, ts_table, &tr_id, sizeof(uint16_t), s);
+	if (s == NULL) {
+		s = (struct my_struct *)malloc(sizeof *s);
+		s->transaction_id = tr_id;
+		HASH_ADD(hh, ts_table, transaction_id, sizeof(uint16_t), s);
+	}
+	switch (ts_option) {
+		case 1:
+			s->receive_query = timestamp;
+			break;
+		case 2:
+			s->cache_hit = timestamp;
+			break;
+		case 3:
+			s->cache_miss = timestamp;
+			break;
+		case 4:
+			s->resolve_callback = timestamp;
+			break;
+		case 5:
+			s->respond_to_client = timestamp;
+			break;
+	}
+	pthread_rwlock_unlock(&uthash_lock);
+}
+
+void destroy_entries(){
+	struct my_struct *current;
+	struct my_struct *tmp;
+	FILE *fp;
+
+	pthread_rwlock_wrlock(&uthash_lock);
+	fp = fopen("/home/sdns_output.txt", "w");
+	HASH_ITER(hh, ts_table, current, tmp) {
+		fprintf(fp, "Transaction ID: %d, recv: %lu, hit: %lu, miss: %lu, callback: %lu, reply: %lu \n", current->transaction_id, current->receive_query, current->cache_hit, current->cache_miss, current->resolve_callback, current->respond_to_client);
+		HASH_DEL(ts_table, current);
+		free(current);
+	}
+	fclose(fp);
+	pthread_rwlock_unlock(&uthash_lock);
+	pthread_rwlock_destroy(&uthash_lock);
 }
